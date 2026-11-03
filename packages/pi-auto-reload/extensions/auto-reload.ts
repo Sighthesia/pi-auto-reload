@@ -75,6 +75,51 @@ const WATCHED_FILES: { file: string; kind: ResourceKind }[] = [
 
 const IGNORED_EXT = /\.(log|tmp|swp|swx|swo|bak|old|orig|rej|~)$/i;
 
+/**
+ * Optional config file: `<agent-dir>/auto-reload.json`.
+ *
+ * Every key is optional and a malformed file falls back to the defaults with a
+ * warning rather than breaking the session. Read once per session start, so
+ * editing it takes effect on the next reload.
+ */
+type Config = {
+	/** Extra directories to watch, absolute or relative to the agent dir. */
+	watch?: string[];
+	/** Resource kinds to ignore, e.g. ["keybindings"]. */
+	ignore?: ResourceKind[];
+	/** Skip the confirmation notice on every reload. */
+	quiet?: boolean;
+};
+
+const CONFIG_FILE = path.join(AGENT_DIR, "auto-reload.json");
+const RESOURCE_KINDS: ResourceKind[] = ["extensions", "skills", "templates", "keybindings"];
+
+function loadConfig(warn: (message: string) => void): Config {
+	try {
+		if (!fs.existsSync(CONFIG_FILE)) return {};
+		const raw: unknown = JSON.parse(fs.readFileSync(CONFIG_FILE, "utf8"));
+		if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
+			warn(`${CONFIG_FILE} must contain a JSON object — using defaults`);
+			return {};
+		}
+		const source = raw as Record<string, unknown>;
+		const config: Config = {};
+		if (Array.isArray(source.watch)) {
+			config.watch = source.watch.filter((entry): entry is string => typeof entry === "string" && entry.length > 0);
+		}
+		if (Array.isArray(source.ignore)) {
+			config.ignore = source.ignore.filter(
+				(entry): entry is ResourceKind => typeof entry === "string" && RESOURCE_KINDS.includes(entry as ResourceKind),
+			);
+		}
+		if (typeof source.quiet === "boolean") config.quiet = source.quiet;
+		return config;
+	} catch (error) {
+		warn(`${CONFIG_FILE} could not be read (${(error as Error).message}) — using defaults`);
+		return {};
+	}
+}
+
 function ignored(relative: string): boolean {
 	if (!relative) return false;
 	const segments = relative.split("/").filter(Boolean);
@@ -98,6 +143,10 @@ export default function (pi: ExtensionAPI) {
 	let enabled = true;
 	let ctx: ExtensionContext | undefined;
 	let watchers: fs.FSWatcher[] = [];
+	let config: Config = {};
+	/** Resolved at session start from config, so `/auto-reload` can report it. */
+	let watchedDirs: { dir: string; kind: ResourceKind }[] = [];
+	let watchedFiles: { file: string; kind: ResourceKind }[] = [];
 
 	/** Resource kinds changed since the last reload. */
 	const dirty = new Set<ResourceKind>();
@@ -132,7 +181,18 @@ export default function (pi: ExtensionAPI) {
 
 	function startWatchers(): void {
 		stopWatchers();
-		for (const { dir, kind } of WATCHED_DIRS) {
+		const skip = new Set(config.ignore ?? []);
+		watchedDirs = WATCHED_DIRS.filter((entry) => !skip.has(entry.kind));
+		watchedFiles = WATCHED_FILES.filter((entry) => !skip.has(entry.kind));
+		// Extra roots from config: watched as `extensions`, the broadest kind, so a
+		// change there still forces a reload.
+		for (const entry of config.watch ?? []) {
+			const dir = path.isAbsolute(entry) ? entry : path.join(AGENT_DIR, entry);
+			if (!watchedDirs.some((existing) => existing.dir === dir)) {
+				watchedDirs.push({ dir, kind: "extensions" });
+			}
+		}
+		for (const { dir, kind } of watchedDirs) {
 			if (!fs.existsSync(dir)) continue;
 			try {
 				// Recursive inotify works on Linux (Node >= 20), macOS and Windows.
@@ -157,7 +217,7 @@ export default function (pi: ExtensionAPI) {
 				ctx?.ui.notify?.(`auto-reload: cannot watch ${dir}`, "warning");
 			}
 		}
-		for (const { file, kind } of WATCHED_FILES) {
+		for (const { file, kind } of watchedFiles) {
 			// Watch the parent so the watch survives atomic replaces and works
 			// before the file exists.
 			const dir = path.dirname(file);
@@ -267,6 +327,7 @@ export default function (pi: ExtensionAPI) {
 			stopWatchers();
 			return;
 		}
+		config = loadConfig((message) => sessionCtx.ui.notify?.(`auto-reload: ${message}`, "warning"));
 		startWatchers();
 		paint();
 
@@ -288,8 +349,7 @@ export default function (pi: ExtensionAPI) {
 		const pending = readPending(sessionCtx);
 		if (!pending) return;
 		ctx.ui.notify?.(`auto-reload: reloaded (${pending.kinds.join(", ")}) — resending your message`, "info");
-		replayWhenIdle(sessionCtx, pending);
-	});
+		replayWhenIdle(sessionCtx, pending);	});
 
 	pi.on("session_shutdown", async () => {
 		// Invalidate any in-flight replay poller before the runtime goes away.
@@ -333,7 +393,9 @@ export default function (pi: ExtensionAPI) {
 			kinds: [...dirty],
 			at: Date.now(),
 		};
-		ctx.ui.notify?.(`auto-reload: reloading (${pending.kinds.join(", ")}) before sending`, "info");
+		if (!config.quiet) {
+			ctx.ui.notify?.(`auto-reload: reloading (${pending.kinds.join(", ")}) before sending`, "info");
+		}
 		// Reload replaces this runtime, so the message must survive outside memory.
 		pi.appendEntry(PENDING_ENTRY, pending);
 		reloading = true;
@@ -384,14 +446,21 @@ export default function (pi: ExtensionAPI) {
 				return;
 			}
 			const watched = [
-				...WATCHED_DIRS.map((entry) => `${entry.dir}${fs.existsSync(entry.dir) ? "" : " (missing)"}`),
-				...WATCHED_FILES.filter((entry) => fs.existsSync(entry.file)).map((entry) => entry.file),
+				...(watchedDirs.length > 0 ? watchedDirs : WATCHED_DIRS).map(
+					(entry) => `${entry.dir}${fs.existsSync(entry.dir) ? "" : " (missing)"}`,
+				),
+				...(watchedFiles.length > 0 ? watchedFiles : WATCHED_FILES)
+					.filter((entry) => fs.existsSync(entry.file))
+					.map((entry) => entry.file),
 			];
+			const ignoredKinds = config.ignore?.length ? config.ignore.join(", ") : "none";
 			commandCtx.ui.notify(
 				[
 					`auto-reload: ${enabled ? "enabled" : "disabled"}`,
 					`idle now: ${commandCtx.isIdle() ? "yes" : "no"}`,
 					`pending: ${dirty.size > 0 ? [...dirty].join(", ") : "none"}`,
+					`config: ${fs.existsSync(CONFIG_FILE) ? CONFIG_FILE : "none (defaults)"}`,
+					`ignored kinds: ${ignoredKinds}`,
 					"reloads on your next message (before skill/template expansion)",
 					...watched.map((line) => `  ${line}`),
 				].join("\n"),

@@ -1,14 +1,25 @@
 # @sighthesia/pi-auto-reload
 
 A [Pi](https://github.com/earendil-works/pi) extension that reloads your resources
-**on your next message**, right before they are used — not on a timer, and never
+**on your next message**, right before they are used — never on a timer, never
 while the agent is running.
+
+## Install
 
 ```sh
 pi install npm:@sighthesia/pi-auto-reload
 ```
 
-Restart your Pi session.
+Restart your Pi session. Verify with `/auto-reload`.
+
+Other install sources:
+
+```sh
+pi install git:github.com/Sighthesia/pi-extensions      # from the repo
+pi -e npm:@sighthesia/pi-auto-reload                    # try once, no settings change
+```
+
+Remove it with `pi remove npm:@sighthesia/pi-auto-reload`.
 
 ## The problem
 
@@ -17,9 +28,9 @@ an extension, you have to remember `/reload`. Forget it, and the agent keeps
 working against the stale version — the worst case being a skill you just rewrote
 that still behaves like the old one.
 
-`/reload` cannot be automated with a timer either: it is not allowed mid-run, and
-a reload throws away extension state, so firing one while you are typing wastes
-work and can swallow what you were about to send.
+A timer cannot automate that either: `/reload` is not allowed mid-run, and it
+throws away extension state, so firing one while you are typing wastes work and can
+swallow what you were about to send.
 
 ## What this does
 
@@ -37,29 +48,51 @@ new runtime re-sends your message, expanded against the fresh resources
 
 The `input` event fires after extension commands are checked and **before** skill
 and prompt-template expansion. That is the whole point: a stale skill can never be
-used, because the reload happens in the gap before expansion, and there is no
-timer to race.
+used, because the reload happens in the gap before expansion, and there is no timer
+to race.
 
-## Why it never reloads mid-run
-
-- Interception requires `ctx.isIdle()`.
-- Messages carrying `streamingBehavior` (steer/follow-up during a run) pass through
-  untouched.
-- Outside TUI mode (`-p`, JSON) no watchers are created at all.
-- The reload command itself re-checks `isIdle()` before calling `ctx.reload()`.
-- A change that lands while the agent works only marks resources dirty. Nothing is
-  reloaded until you send something new.
+You still get the reload — you just never wait for one, and never lose a message to
+one.
 
 ## Commands
 
-```sh
-/auto-reload          # status: enabled/disabled, idle state, pending resources, watched paths
-/auto-reload off      # disable
-/auto-reload on
-```
+| Command | What it does |
+| --- | --- |
+| `/auto-reload` | Show status: enabled/disabled, whether the agent is idle, pending resource kinds, config file in use, ignored kinds, and every watched path. |
+| `/auto-reload on` | Enable the extension. |
+| `/auto-reload off` | Disable it. Pending changes are dropped and watchers go quiet until you turn it back on. |
 
 The footer shows `reload pending · skills` while resources are dirty and
 `reloading…` during the swap. Nothing is shown when idle and clean.
+
+## Configuration
+
+Optional. Create `<agent-dir>/auto-reload.json` — `~/.pi/agent/auto-reload.json` by
+default, or under `PI_CODING_AGENT_DIR` when that is set.
+
+```json
+{
+  "watch": ["notes-skills", "/home/me/shared/prompts"],
+  "ignore": ["keybindings"],
+  "quiet": false
+}
+```
+
+| Key | Type | Default | Meaning |
+| --- | --- | --- | --- |
+| `watch` | `string[]` | `[]` | Extra directories to watch, absolute or relative to the agent dir. A change in any of them counts as an `extensions` change. |
+| `ignore` | `string[]` | `[]` | Resource kinds to stop watching. Valid values: `extensions`, `skills`, `templates`, `keybindings`. |
+| `quiet` | `boolean` | `false` | Suppress the notice shown when a reload starts. Warnings about lost messages are never suppressed. |
+
+Notes:
+
+- The file is read at every session start, so a change takes effect after the next
+  reload or Pi restart. There is no live reload of this file.
+- Malformed JSON, a non-object root, or a wrongly typed key falls back to the
+  defaults. Malformed JSON and unreadable files also produce a warning; wrongly
+  typed keys are dropped silently.
+- `themes` is deliberately not an `ignore` value. Pi already hot-reloads the active
+  user theme, so this extension never watches it in the first place.
 
 ## What is watched
 
@@ -70,6 +103,7 @@ The footer shows `reload pending · skills` while resources are dirty and
 | `<agent-dir>/prompts/` (recursive) | `templates` |
 | `<agent-dir>/keybindings.json` | `keybindings` |
 | `<cwd>/<config-dir>/keybindings.json` | `keybindings` |
+| every entry in `watch` | `extensions` |
 
 `<agent-dir>` is `~/.pi/agent` unless `PI_CODING_AGENT_DIR` overrides it.
 
@@ -81,6 +115,16 @@ Ignored: dot-prefixed files, `node_modules/`, `__pycache__/`, and
 `*.log|tmp|swp|swo|bak|old|orig|rej|~`. Editor swap files and `pnpm install` churn
 therefore do not trigger anything. A resource directory literally named `dist` or
 `build` is *not* ignored — only dependency directories are.
+
+## Why it never reloads mid-run
+
+- Interception requires `ctx.isIdle()`.
+- Messages carrying `streamingBehavior` (steer/follow-up during a run) pass through
+  untouched.
+- Outside TUI mode (`-p`, JSON) no watchers are created at all.
+- The reload command itself re-checks `isIdle()` before calling `ctx.reload()`.
+- A change that lands while the agent works only marks resources dirty. Nothing is
+  reloaded until you send something new.
 
 ## Failure behavior
 
@@ -94,6 +138,19 @@ therefore do not trigger anything. A resource directory literally named `dist` o
   re-arms itself after 1 s rather than going permanently blind.
 - **`/new`, `/resume`, `/quit` during a pending replay**: a generation counter
   stops the poller from touching the replaced runtime.
+
+## Differences from `pi-auto-reload`
+
+There is an unrelated npm package called `pi-auto-reload` (by subaud-tools). Both
+reload a session, but they watch different things:
+
+| | `pi-auto-reload` | this package |
+| --- | --- | --- |
+| Triggers on | installed npm packages changing on disk, `settings.json`'s package list, channel server upgrades | your hand-edited resource files |
+| When | polls every 15 s, reloads as soon as idle | on your next message, before skill/template expansion |
+| Timer | yes | no |
+
+They can be installed together; the command names do not collide.
 
 ## Requirements
 

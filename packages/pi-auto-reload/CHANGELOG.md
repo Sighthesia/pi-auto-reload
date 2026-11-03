@@ -5,6 +5,17 @@ All notable changes to `@sighthesia/pi-auto-reload` are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.1.0]
+
+### Added
+
+- **Optional config file at `<agent-dir>/auto-reload.json`.** `watch` adds extra
+  directories to watch, `ignore` drops resource kinds, and `quiet` suppresses the
+  reload notice. Malformed JSON warns and falls back to the defaults; wrongly typed
+  keys are dropped silently.
+- `/auto-reload` now reports the config file in use, the ignored kinds, and the
+  paths actually being watched, including any added by `watch`.
+
 ## [1.0.0]
 
 ### Added
