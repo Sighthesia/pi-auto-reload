@@ -5,7 +5,7 @@ All notable changes to `@sighthesia/pi-auto-reload` are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [1.2.0]
+## [1.3.0]
 
 ### Added
 
@@ -15,6 +15,8 @@ Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   from an autocomplete provider, and the `/` request itself returns no items. Guarded
   by the same rules as everything else: idle agent, dirty resources, not already
   reloading.
+
+## [1.2.0]
 
 ### Changed
 
