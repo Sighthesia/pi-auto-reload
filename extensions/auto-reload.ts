@@ -11,6 +11,14 @@
  * so intercepting there reloads before a stale skill, template, keybinding or
  * extension can be used, without any timer or race.
  *
+ * Flow (agent idle, resources dirty, user types `/`):
+ *   1. An autocomplete provider notices the lone `/` at the start of the line and
+ *      dispatches the reload. Pi builds the slash menu from a snapshot taken in
+ *      `setupAutocompleteProvider()`, so only a reload can make a newly created
+ *      skill appear there; `getSuggestions` is the only hook that sees typing.
+ *      That request answers empty — the menu opens on the next keystroke against
+ *      the reloaded runtime.
+ *
  * Flow (agent idle, resources dirty, user sends a message):
  *   1. `input` returns `{ action: "handled" }`, so the agent never starts on the
  *      stale runtime (verified: the prompt response reports `handled`).
@@ -352,6 +360,7 @@ export default function (pi: ExtensionAPI) {
 		}
 		config = loadConfig((message) => sessionCtx.ui.notify?.(`auto-reload: ${message}`, "warning"));
 		startWatchers();
+		installSlashTrigger(sessionCtx);
 
 		if (event.reason !== "reload") {
 			// A pending entry outside the reload path means the last replay never
@@ -373,6 +382,57 @@ export default function (pi: ExtensionAPI) {
 		ctx.ui.notify?.(`auto-reload: reloaded (${pending.kinds.join(", ")}) — resending your message`, "info");
 		replayWhenIdle(sessionCtx, pending);
 	});
+
+	/**
+	 * Makes typing `/` reload the runtime, so the slash menu that opens on the
+	 * next keystroke already lists newly created skills, templates and commands.
+	 *
+	 * Why this is an autocomplete provider and not something cleaner: Pi builds the
+	 * slash menu from a snapshot taken in `setupAutocompleteProvider()`, and only
+	 * `/reload` rebuilds it (see `handleReloadCommand`). `getSuggestions` is the
+	 * one hook that observes typing, and it cannot rewrite that snapshot — it can
+	 * only return items. So the reload is dispatched from here and *this* request
+	 * answers empty; the provider installed by the reloaded runtime serves the
+	 * second keystroke with fresh resources.
+	 *
+	 * Guards, because a reload discards session state: the user must actually have
+	 * just typed `/` at the start of the line, resources must be dirty, the agent
+	 * must be idle, and nothing may already be in flight.
+	 */
+	function installSlashTrigger(sessionCtx: ExtensionContext): void {
+		sessionCtx.ui.addAutocompleteProvider?.((current) => ({
+			async getSuggestions(lines, cursorLine, cursorCol, options) {
+				const line = lines[cursorLine] ?? "";
+				const beforeCursor = line.slice(0, cursorCol);
+				const atSlash = cursorLine === 0 && beforeCursor === "/";
+				if (atSlash && enabled && dirty.size > 0 && !reloading && sessionCtx.isIdle()) {
+					dispatchReload();
+					return { prefix: "/", items: [] };
+				}
+				return current.getSuggestions(lines, cursorLine, cursorCol, options);
+			},
+			applyCompletion(lines, cursorLine, cursorCol, item, prefix) {
+				return current.applyCompletion(lines, cursorLine, cursorCol, item, prefix);
+			},
+			shouldTriggerFileCompletion(lines, cursorLine, cursorCol) {
+				return current.shouldTriggerFileCompletion?.(lines, cursorLine, cursorCol) ?? true;
+			},
+		}));
+	}
+
+	/**
+	 * Dispatch the internal reload command. No message is stashed: the slash menu
+	 * is not a prompt, and Pi restores the editor text across a reload.
+	 */
+	function dispatchReload(): void {
+		if (!pi.getCommands?.().some((command) => command.name === TOGGLE_COMMAND)) return;
+		reloading = true;
+		try {
+			pi.sendUserMessage(`/${TOGGLE_COMMAND} ${APPLY_ARG}`, { expandPromptTemplates: true });
+		} catch {
+			reloading = false;
+		}
+	}
 
 	pi.on("session_shutdown", async () => {
 		// Invalidate any in-flight replay poller before the runtime goes away.

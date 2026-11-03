@@ -7,6 +7,15 @@ Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [1.2.0]
 
+### Added
+
+- **Typing `/` at the start of an empty line reloads when resources are dirty**, so
+  a skill you just created appears in the slash menu on the next keystroke. Pi
+  builds that menu from a snapshot only `/reload` rebuilds; the reload is dispatched
+  from an autocomplete provider, and the `/` request itself returns no items. Guarded
+  by the same rules as everything else: idle agent, dirty resources, not already
+  reloading.
+
 ### Changed
 
 - **`/auto-reload` is now a single toggle.** The old `on`/`off` arguments and the

@@ -3,9 +3,7 @@
 [![npm](https://img.shields.io/npm/v/@sighthesia/pi-auto-reload.svg)](https://www.npmjs.com/package/@sighthesia/pi-auto-reload)
 [![license](https://img.shields.io/npm/l/@sighthesia/pi-auto-reload.svg)](LICENSE)
 
-A [Pi](https://github.com/earendil-works/pi) extension that reloads your resources
-**on your next message**, right before they are used — never on a timer, never
-while the agent is running.
+A [Pi](https://github.com/earendil-works/pi) extension that reloads your resources **on your next message**, right before they are used.
 
 ## Install
 
@@ -55,6 +53,9 @@ and prompt-template expansion. That is the whole point: a stale skill can never 
 used, because the reload happens in the gap before expansion, and there is no timer
 to race.
 
+Typing `/` covers the other half of the problem — seeing a newly created skill in
+the menu at all.
+
 You still get the reload — you just never wait for one, and never lose a message to
 one.
 
@@ -71,6 +72,18 @@ dropping them.
 
 There is no `/auto-reload on|off` and no status view — one command, one job. There
 is also no footer line: the extension stays quiet until it actually reloads.
+
+## Typing `/` reloads
+
+Pi builds the slash menu from a snapshot, and only `/reload` rebuilds it. So a
+skill you just created is invisible in the menu until something reloads. Typing
+`/` at the start of an empty line now does that: if resources are dirty and the
+agent is idle, the reload is dispatched and the menu opens on the next keystroke
+with the fresh list.
+
+The cost is that the `/` itself shows no menu (the request that triggers the
+reload returns nothing); `/s` right after it lists the reloaded skills. If the
+agent is busy, nothing reloads and the menu behaves normally.
 
 ## Configuration
 
