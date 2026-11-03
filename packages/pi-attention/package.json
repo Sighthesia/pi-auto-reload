@@ -1,0 +1,21 @@
+{
+	"name": "@sighthesia/pi-attention",
+	"version": "1.0.0",
+	"description": "Pi extension package. Notifies you the moment the agent needs an answer, and reloads Pi's resources lazily on your next message instead of on a timer.",
+	"keywords": ["pi-package", "pi-extension", "notification", "reload", "hot-reload"],
+	"license": "MIT",
+	"author": "Sighthesia",
+	"type": "module",
+	"files": ["extensions/", "README.md", "CHANGELOG.md", "LICENSE"],
+	"pi": {
+		"extensions": ["./extensions/ask-user-notify.ts", "./extensions/auto-reload.ts"]
+	},
+	"peerDependencies": {
+		"@earendil-works/pi-coding-agent": "*"
+	},
+	"peerDependenciesMeta": {
+		"@earendil-works/pi-coding-agent": {
+			"optional": true
+		}
+	}
+}
