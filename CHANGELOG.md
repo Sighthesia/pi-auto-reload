@@ -5,6 +5,26 @@ All notable changes to `@sighthesia/pi-auto-reload` are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.2.0]
+
+### Changed
+
+- **`/auto-reload` is now a single toggle.** The old `on`/`off` arguments and the
+  status view are gone: one invocation flips the extension and reports the new
+  state, including any kinds left pending. The state is persisted to
+  `<agent-dir>/auto-reload.state.json`, so it survives a reload and a restart
+  instead of resetting to enabled each session.
+- **No footer status line.** `reload pending · <kinds>` and `reloading…` are no
+  longer painted; the extension is silent until a reload actually happens.
+- While disabled, changes are remembered rather than dropped, so re-enabling
+  reports them as pending instead of silently ignoring the edits.
+
+### Removed
+
+- **`/auto-reload-apply` is no longer a separate command.** The reload dispatcher
+  is now `/auto-reload apply`, an internal argument of the same command, so the
+  package registers exactly one slash command.
+
 ## [1.1.0]
 
 ### Added

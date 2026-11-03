@@ -1,6 +1,6 @@
 {
 	"name": "@sighthesia/pi-auto-reload",
-	"version": "1.1.0",
+	"version": "1.2.0",
 	"description": "Pi extension. Reloads extensions, skills, prompts and keybindings on your next message — never on a timer, never mid-run. Configurable via auto-reload.json.",
 	"keywords": [
 		"pi-package",

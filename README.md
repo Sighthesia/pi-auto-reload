@@ -13,7 +13,8 @@ while the agent is running.
 pi install npm:@sighthesia/pi-auto-reload
 ```
 
-Restart your Pi session. Verify with `/auto-reload`.
+Restart your Pi session. It starts enabled and silent; edit anything under
+`~/.pi/agent/skills/` and send a message to see it reload.
 
 Other install sources:
 
@@ -44,7 +45,7 @@ you send your next message
       ↓
 input hook intercepts, before /skill: and template expansion
       ↓
-message is persisted, /auto-reload-apply runs ctx.reload()
+message is persisted, /auto-reload apply runs ctx.reload()
       ↓
 new runtime re-sends your message, expanded against the fresh resources
 ```
@@ -61,12 +62,15 @@ one.
 
 | Command | What it does |
 | --- | --- |
-| `/auto-reload` | Show status: enabled/disabled, whether the agent is idle, pending resource kinds, config file in use, ignored kinds, and every watched path. |
-| `/auto-reload on` | Enable the extension. |
-| `/auto-reload off` | Disable it. Pending changes are dropped and watchers go quiet until you turn it back on. |
+| `/auto-reload` | Toggle the extension on or off, and say so: `auto-reload on`, `auto-reload on — reload pending (skills)`, or `auto-reload off`. |
 
-The footer shows `reload pending · skills` while resources are dirty and
-`reloading…` during the swap. Nothing is shown when idle and clean.
+The toggle is remembered in `<agent-dir>/auto-reload.state.json`, so it survives a
+reload and a Pi restart. While off, watchers stay armed but only remember what
+changed: turning it back on reports those kinds as pending instead of silently
+dropping them.
+
+There is no `/auto-reload on|off` and no status view — one command, one job. There
+is also no footer line: the extension stays quiet until it actually reloads.
 
 ## Configuration
 
@@ -89,6 +93,8 @@ default, or under `PI_CODING_AGENT_DIR` when that is set.
 
 Notes:
 
+- `<agent-dir>/auto-reload.state.json` holds only the on/off toggle written by
+  `/auto-reload`. It is managed for you; delete it to start enabled again.
 - The file is read at every session start, so a change takes effect after the next
   reload or Pi restart. There is no live reload of this file.
 - Malformed JSON, a non-object root, or a wrongly typed key falls back to the

@@ -16,8 +16,9 @@
  *      stale runtime (verified: the prompt response reports `handled`).
  *   2. The message is persisted as a custom session entry (JSON-safe) — reload
  *      replaces the runtime, so in-memory state cannot carry it across.
- *   3. `/auto-reload-apply` dispatches `ctx.reload()` (commands are the only
- *      context allowed to call it).
+ *   3. The same `/auto-reload` command, invoked with the internal `apply`
+ *      argument, dispatches `ctx.reload()` (commands are the only context
+ *      allowed to call it).
  *   4. The new runtime's `session_start` (reason "reload") finds the entry, waits
  *      until the session is idle (a `sendUserMessage` issued while busy is dropped
  *      silently), then re-sends the message — expanded against the reloaded
@@ -33,8 +34,11 @@
  * Themes are excluded: Pi hot-reloads the active user theme by itself.
  *
  * Commands:
- *   /auto-reload          status + on/off toggle
- *   /auto-reload on|off   explicit
+ *   /auto-reload          toggle on/off (persisted, so a reload keeps it)
+ *   /auto-reload apply    internal: run the reload the toggle command exists for
+ *
+ * There is no footer status line: the extension is silent until it reloads, and
+ * a reload is announced only when it actually happens.
  */
 
 import * as fs from "node:fs";
@@ -43,8 +47,9 @@ import * as path from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { CONFIG_DIR_NAME } from "@earendil-works/pi-coding-agent";
 
-const STATUS_KEY = "auto-reload";
-const RELOAD_COMMAND = "auto-reload-apply";
+const TOGGLE_COMMAND = "auto-reload";
+/** Argument that turns the toggle command into the reload dispatcher. */
+const APPLY_ARG = "apply";
 /** Custom session entry carrying the intercepted message across the reload. */
 const PENDING_ENTRY = "pi.auto-reload-pending";
 /** Written right after a replay so a stale pending entry is never replayed twice. */
@@ -94,6 +99,35 @@ type Config = {
 const CONFIG_FILE = path.join(AGENT_DIR, "auto-reload.json");
 const RESOURCE_KINDS: ResourceKind[] = ["extensions", "skills", "templates", "keybindings"];
 
+/**
+ * Toggle state, kept apart from `auto-reload.json` so the extension never
+ * rewrites a file the user authored. A reload re-evaluates this module, so the
+ * state has to live outside memory to survive one.
+ */
+const STATE_FILE = path.join(AGENT_DIR, "auto-reload.state.json");
+
+function loadEnabled(): boolean {
+	try {
+		if (!fs.existsSync(STATE_FILE)) return true;
+		const raw: unknown = JSON.parse(fs.readFileSync(STATE_FILE, "utf8"));
+		if (raw && typeof raw === "object" && typeof (raw as { enabled?: unknown }).enabled === "boolean") {
+			return (raw as { enabled: boolean }).enabled;
+		}
+	} catch {
+		// An unreadable state file must not silently disable the extension.
+	}
+	return true;
+}
+
+function saveEnabled(value: boolean): void {
+	try {
+		fs.mkdirSync(AGENT_DIR, { recursive: true });
+		fs.writeFileSync(STATE_FILE, `${JSON.stringify({ enabled: value }, null, 2)}\n`);
+	} catch {
+		// Best effort: the toggle still holds for the current runtime.
+	}
+}
+
 function loadConfig(warn: (message: string) => void): Config {
 	try {
 		if (!fs.existsSync(CONFIG_FILE)) return {};
@@ -140,33 +174,19 @@ type StashedInput = {
 };
 
 export default function (pi: ExtensionAPI) {
-	let enabled = true;
+	let enabled = loadEnabled();
 	let ctx: ExtensionContext | undefined;
 	let watchers: fs.FSWatcher[] = [];
 	let config: Config = {};
-	/** Resolved at session start from config, so `/auto-reload` can report it. */
-	let watchedDirs: { dir: string; kind: ResourceKind }[] = [];
-	let watchedFiles: { file: string; kind: ResourceKind }[] = [];
 
 	/** Resource kinds changed since the last reload. */
 	const dirty = new Set<ResourceKind>();
+	/** Changes seen while disabled; they must not be lost by re-enabling. */
+	const missed = new Set<ResourceKind>();
 	/** A reload was dispatched and has not replaced this runtime yet. */
 	let reloading = false;
 	/** Bumped on every session start and shutdown; invalidates in-flight replay pollers. */
 	let generation = 0;
-
-	function paint(): void {
-		if (!ctx?.hasUI) return;
-		if (!enabled) {
-			ctx.ui.setStatus(STATUS_KEY, "auto-reload off");
-			return;
-		}
-		if (reloading) {
-			ctx.ui.setStatus(STATUS_KEY, "reloading…");
-			return;
-		}
-		ctx.ui.setStatus(STATUS_KEY, dirty.size > 0 ? `reload pending · ${[...dirty].join(",")}` : undefined);
-	}
 
 	function stopWatchers(): void {
 		for (const watcher of watchers) {
@@ -182,8 +202,8 @@ export default function (pi: ExtensionAPI) {
 	function startWatchers(): void {
 		stopWatchers();
 		const skip = new Set(config.ignore ?? []);
-		watchedDirs = WATCHED_DIRS.filter((entry) => !skip.has(entry.kind));
-		watchedFiles = WATCHED_FILES.filter((entry) => !skip.has(entry.kind));
+		const watchedDirs = WATCHED_DIRS.filter((entry) => !skip.has(entry.kind));
+		const watchedFiles = WATCHED_FILES.filter((entry) => !skip.has(entry.kind));
 		// Extra roots from config: watched as `extensions`, the broadest kind, so a
 		// change there still forces a reload.
 		for (const entry of config.watch ?? []) {
@@ -236,10 +256,13 @@ export default function (pi: ExtensionAPI) {
 
 	/** Records the change only. A reload needs an idle agent and a reason to use it. */
 	function markDirty(kind: ResourceKind): void {
-		if (!enabled) return;
-		if (dirty.has(kind)) return;
+		if (!enabled) {
+			// Remembered, not dropped: turning the extension back on must still
+			// reload the resources that changed while it was off.
+			missed.add(kind);
+			return;
+		}
 		dirty.add(kind);
-		paint();
 	}
 
 	function readPending(sessionCtx: ExtensionContext): StashedInput | undefined {
@@ -329,7 +352,6 @@ export default function (pi: ExtensionAPI) {
 		}
 		config = loadConfig((message) => sessionCtx.ui.notify?.(`auto-reload: ${message}`, "warning"));
 		startWatchers();
-		paint();
 
 		if (event.reason !== "reload") {
 			// A pending entry outside the reload path means the last replay never
@@ -349,7 +371,8 @@ export default function (pi: ExtensionAPI) {
 		const pending = readPending(sessionCtx);
 		if (!pending) return;
 		ctx.ui.notify?.(`auto-reload: reloaded (${pending.kinds.join(", ")}) — resending your message`, "info");
-		replayWhenIdle(sessionCtx, pending);	});
+		replayWhenIdle(sessionCtx, pending);
+	});
 
 	pi.on("session_shutdown", async () => {
 		// Invalidate any in-flight replay poller before the runtime goes away.
@@ -381,9 +404,8 @@ export default function (pi: ExtensionAPI) {
 				);
 				inputCtx.ui.setEditorText?.(orphan.text);
 			}
-			paint();
 		}
-		if (!pi.getCommands?.().some((command) => command.name === RELOAD_COMMAND)) {
+		if (!pi.getCommands?.().some((command) => command.name === TOGGLE_COMMAND)) {
 			return { action: "continue" as const };
 		}
 
@@ -399,12 +421,10 @@ export default function (pi: ExtensionAPI) {
 		// Reload replaces this runtime, so the message must survive outside memory.
 		pi.appendEntry(PENDING_ENTRY, pending);
 		reloading = true;
-		paint();
 		try {
-			pi.sendUserMessage(`/${RELOAD_COMMAND}`, { expandPromptTemplates: true });
+			pi.sendUserMessage(`/${TOGGLE_COMMAND} ${APPLY_ARG}`, { expandPromptTemplates: true });
 		} catch {
 			reloading = false;
-			paint();
 			return { action: "continue" as const };
 		}
 		// Handled: the agent must not start on the stale runtime. The replay in
@@ -412,60 +432,43 @@ export default function (pi: ExtensionAPI) {
 		return { action: "handled" as const };
 	});
 
-	pi.registerCommand(RELOAD_COMMAND, {
-		description: "Apply a pending auto-reload (internal)",
-		handler: async (_args, commandCtx) => {
+	pi.registerCommand(TOGGLE_COMMAND, {
+		description: "Toggle auto-reload on or off",
+		handler: async (args, commandCtx) => {
 			ctx = commandCtx;
-			// The command is public, so guard it: reloading under a running agent is
-			// unsupported and would leave `reloading` stuck.
+			if (args.trim().toLowerCase() !== APPLY_ARG) {
+				enabled = !enabled;
+				saveEnabled(enabled);
+				if (enabled) {
+					// Changes from the disabled period are still applicable; make them
+					// pending so the toggle does not silently swallow them.
+					for (const kind of missed) dirty.add(kind);
+				}
+				missed.clear();
+				if (!enabled) {
+					// Not yet applied: carry the pending kinds over so re-enabling does not
+					// lose a change that was never reloaded.
+					for (const kind of dirty) missed.add(kind);
+					dirty.clear();
+				}
+				const next = enabled
+					? dirty.size > 0
+						? `on — reload pending (${[...dirty].join(", ")})`
+						: "on"
+					: "off";
+				commandCtx.ui.notify(`auto-reload ${next}`, "info");
+				return;
+			}
+			// Reload under a running agent is unsupported and would leave `reloading`
+			// stuck, so the internal dispatch re-checks idleness.
 			if (!commandCtx.isIdle()) {
 				commandCtx.ui.notify?.("auto-reload: agent is running — reload skipped", "warning");
 				return;
 			}
 			reloading = true;
-			paint();
 			// Terminal for this handler: the runtime is replaced underneath it.
 			await commandCtx.reload();
 			return;
-		},
-	});
-
-	pi.registerCommand("auto-reload", {
-		description: "Auto-reload status, or /auto-reload on|off",
-		handler: async (args, commandCtx) => {
-			ctx = commandCtx;
-			const arg = args.trim().toLowerCase();
-			if (arg === "on" || arg === "off") {
-				enabled = arg === "on";
-				if (!enabled) {
-					dirty.clear();
-					reloading = false;
-				}
-				paint();
-				commandCtx.ui.notify(`auto-reload ${enabled ? "enabled" : "disabled"}`, "info");
-				return;
-			}
-			const watched = [
-				...(watchedDirs.length > 0 ? watchedDirs : WATCHED_DIRS).map(
-					(entry) => `${entry.dir}${fs.existsSync(entry.dir) ? "" : " (missing)"}`,
-				),
-				...(watchedFiles.length > 0 ? watchedFiles : WATCHED_FILES)
-					.filter((entry) => fs.existsSync(entry.file))
-					.map((entry) => entry.file),
-			];
-			const ignoredKinds = config.ignore?.length ? config.ignore.join(", ") : "none";
-			commandCtx.ui.notify(
-				[
-					`auto-reload: ${enabled ? "enabled" : "disabled"}`,
-					`idle now: ${commandCtx.isIdle() ? "yes" : "no"}`,
-					`pending: ${dirty.size > 0 ? [...dirty].join(", ") : "none"}`,
-					`config: ${fs.existsSync(CONFIG_FILE) ? CONFIG_FILE : "none (defaults)"}`,
-					`ignored kinds: ${ignoredKinds}`,
-					"reloads on your next message (before skill/template expansion)",
-					...watched.map((line) => `  ${line}`),
-				].join("\n"),
-				"info",
-			);
 		},
 	});
 }
