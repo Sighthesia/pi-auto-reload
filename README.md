@@ -3,7 +3,7 @@
 [![npm](https://img.shields.io/npm/v/@sighthesia/pi-auto-reload.svg)](https://www.npmjs.com/package/@sighthesia/pi-auto-reload)
 [![license](https://img.shields.io/npm/l/@sighthesia/pi-auto-reload.svg)](LICENSE)
 
-A [Pi](https://github.com/earendil-works/pi) extension that reloads your resources **on your next message**, right before they are used.
+Lazy reload pi after editing a skill, a prompt template, a keybinding or an extension.
 
 ## Install
 
