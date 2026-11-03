@@ -1,0 +1,21 @@
+{
+	"name": "@sighthesia/pi-auto-reload",
+	"version": "1.0.0",
+	"description": "Pi extension. Reloads extensions, skills, prompts and keybindings on your next message, right before they are used — never on a timer, never mid-run.",
+	"keywords": ["pi-package", "pi-extension", "reload", "hot-reload", "watch"],
+	"license": "MIT",
+	"author": "Sighthesia",
+	"type": "module",
+	"files": ["extensions/", "README.md", "CHANGELOG.md", "LICENSE"],
+	"pi": {
+		"extensions": ["./extensions/auto-reload.ts"]
+	},
+	"peerDependencies": {
+		"@earendil-works/pi-coding-agent": "*"
+	},
+	"peerDependenciesMeta": {
+		"@earendil-works/pi-coding-agent": {
+			"optional": true
+		}
+	}
+}

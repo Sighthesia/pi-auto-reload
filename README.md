@@ -4,12 +4,12 @@ Personal [Pi](https://github.com/earendil-works/pi) extension packages.
 
 | Package | What it does |
 | --- | --- |
-| [`@sighthesia/pi-attention`](packages/pi-attention) | Notifies you when the agent needs an answer; reloads Pi's resources lazily on your next message instead of on a timer. |
+| [`@sighthesia/pi-auto-reload`](packages/pi-auto-reload) | Reloads extensions, skills, prompts and keybindings on your next message, right before they are used — never on a timer, never mid-run. |
 
 ## Install
 
 ```sh
-pi install npm:@sighthesia/pi-attention
+pi install npm:@sighthesia/pi-auto-reload
 ```
 
 Or from git, before a release:
