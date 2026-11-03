@@ -2,9 +2,9 @@
 
 Personal [Pi](https://github.com/earendil-works/pi) extension packages.
 
-| Package | What it does |
-| --- | --- |
-| [`@sighthesia/pi-auto-reload`](packages/pi-auto-reload) | Reloads extensions, skills, prompts and keybindings on your next message, right before they are used — never on a timer, never mid-run. |
+| Package | npm | What it does |
+| --- | --- | --- |
+| [`@sighthesia/pi-auto-reload`](packages/pi-auto-reload) | [![npm](https://img.shields.io/npm/v/@sighthesia/pi-auto-reload.svg)](https://www.npmjs.com/package/@sighthesia/pi-auto-reload) | Reloads extensions, skills, prompts and keybindings on your next message, right before they are used — never on a timer, never mid-run. |
 
 ## Install
 
