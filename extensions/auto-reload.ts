@@ -70,6 +70,12 @@ const REPLAY_WAIT_MS = 10_000;
 const REPLAY_CONFIRM_MS = 2_000;
 /** Attempts before the text goes back to the editor. */
 const REPLAY_ATTEMPTS = 3;
+/**
+ * A stash older than this is never replayed. A reload chain takes seconds, so an
+ * old entry means the replay was already abandoned; resending it would resurrect a
+ * message the user has long since moved past.
+ */
+const REPLAY_MAX_AGE_MS = 60_000;
 /** Delay before re-creating watchers whose root was replaced. */
 const REARM_DELAY_MS = 1000;
 
@@ -403,7 +409,7 @@ export default function (pi: ExtensionAPI) {
 	 * newest pending entry and consider it owed unless a consumed entry for its id
 	 * exists anywhere in the session.
 	 */
-	function readPending(sessionCtx: ExtensionContext): StashedInput | undefined {
+	function readPending(sessionCtx: ExtensionContext, options?: { maxAgeMs?: number }): StashedInput | undefined {
 		try {
 			const entries = sessionCtx.sessionManager.getEntries();
 			const consumed = new Set<string>();
@@ -418,11 +424,42 @@ export default function (pi: ExtensionAPI) {
 				const data = entry.data as StashedInput | undefined;
 				if (!data || typeof data.text !== "string") continue;
 				if (typeof data.id === "string" && consumed.has(data.id)) return undefined;
+				// Only the replay path ages out a stash; the recovery paths still want to see
+				// an old one so they can tell the user about it and retire it.
+				const maxAge = options?.maxAgeMs;
+				if (maxAge !== undefined && typeof data.at === "number" && Date.now() - data.at > maxAge) return undefined;
 				return data;
 			}
 			return undefined;
 		} catch {
 			return undefined;
+		}
+	}
+
+	/**
+	 * Retire a stash so it can never be replayed again.
+	 *
+	 * Every path that gives the text back to the user must call this. A stash that
+	 * is merely *ignored* stays replayable, and since the session outlives the
+	 * runtime, the next reload would resend a message the user already got back —
+	 * that is exactly how an aborted turn used to turn into a duplicate message on
+	 * every later reload.
+	 */
+	function retire(pending: StashedInput): void {
+		try {
+			pi.appendEntry(CONSUMED_ENTRY, { id: pending.id, at: Date.now(), kinds: pending.kinds });
+		} catch {
+			// Runtime is gone; nothing left to protect against.
+		}
+	}
+
+	/** Warn about a stash, hand the text back, and retire it. */
+	function recover(sessionCtx: ExtensionContext, pending: StashedInput, reason: string): void {
+		try {
+			sessionCtx.ui.notify?.(`auto-reload: ${reason} — your message was not sent: ${pending.text.slice(0, 60)}`, "warning");
+			sessionCtx.ui.setEditorText?.(pending.text);
+		} finally {
+			retire(pending);
 		}
 	}
 
@@ -470,24 +507,16 @@ export default function (pi: ExtensionAPI) {
 		const alive = () => myGeneration === generation && sessionCtx.hasUI;
 
 		const handBack = (reason: string) => {
-			try {
-				pi.appendEntry(CONSUMED_ENTRY, { id: pending.id, at: Date.now(), kinds: pending.kinds });
-				sessionCtx.ui.notify?.(`auto-reload: ${reason} — your message was not sent: ${pending.text.slice(0, 60)}`, "warning");
-				// Put it where the user can resend it instead of pretending it went out.
-				sessionCtx.ui.setEditorText?.(pending.text);
-			} catch {
-				// Runtime went away; nothing to recover into.
+			if (!alive()) {
+				// The runtime was replaced mid-wait. The stash must still be retired, or the
+				// next runtime would replay a message this one already gave up on.
+				retire(pending);
+				return;
 			}
+			recover(sessionCtx, pending, reason);
 		};
 
-		const done = () => {
-			try {
-				pi.appendEntry(CONSUMED_ENTRY, { id: pending.id, at: Date.now(), kinds: pending.kinds });
-			} catch {
-				// Runtime went away after a successful send; the entry is not replayable
-				// anyway because the reload chain ended.
-			}
-		};
+		const done = () => retire(pending);
 
 		const tick = () => {
 			if (!alive()) return;
@@ -556,21 +585,22 @@ export default function (pi: ExtensionAPI) {
 
 		if (event.reason !== "reload") {
 			// A pending entry outside the reload path means the last replay never
-			// happened (stale runtime, aborted turn). Say so rather than dropping it.
+			// happened (stale runtime, aborted turn). Say so and retire it: leaving it
+			// unconsumed would make every later reload resend it again.
 			const stale = readPending(sessionCtx);
-			if (stale) {
-				sessionCtx.ui.notify?.(
-					`auto-reload: an earlier message was never sent: ${stale.text.slice(0, 60)}`,
-					"warning",
-				);
-				sessionCtx.ui.setEditorText?.(stale.text);
-			}
+			if (stale) recover(sessionCtx, stale, "an earlier message was never sent");
 			return;
 		}
 		// A reload replaced the runtime: this extension's `dirty` set is gone with
 		// it, and the intercepted message (if any) is waiting in the session.
-		const pending = readPending(sessionCtx);
-		if (!pending) return;
+		const pending = readPending(sessionCtx, { maxAgeMs: REPLAY_MAX_AGE_MS });
+		if (!pending) {
+			// Anything older than the window is an abandoned reload; retire it silently so
+			// it cannot resurface on a later reload.
+			const abandoned = readPending(sessionCtx);
+			if (abandoned) retire(abandoned);
+			return;
+		}
 		ctx.ui.notify?.(`auto-reload: reloaded (${pending.kinds.join(", ")}) — resending your message`, "info");
 		replayWhenIdle(sessionCtx, pending);
 	});
@@ -645,17 +675,12 @@ export default function (pi: ExtensionAPI) {
 		if (event.streamingBehavior) return { action: "continue" as const };
 		// We are still in the runtime that asked for a reload: the dispatch did not
 		// land (dropped message, collapsed turn). Recover the stashed text instead of
-		// silently overwriting it with this one.
+		// silently overwriting it with this one, and retire it so a later reload does
+		// not replay it a second time.
 		if (reloading) {
 			reloading = false;
 			const orphan = readPending(inputCtx);
-			if (orphan) {
-				inputCtx.ui.notify?.(
-					`auto-reload: the previous message was never sent: ${orphan.text.slice(0, 60)}`,
-					"warning",
-				);
-				inputCtx.ui.setEditorText?.(orphan.text);
-			}
+			if (orphan) recover(inputCtx, orphan, "the previous message was never sent");
 		}
 		if (!pi.getCommands?.().some((command) => command.name === TOGGLE_COMMAND)) {
 			return { action: "continue" as const };

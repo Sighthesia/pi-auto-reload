@@ -5,6 +5,20 @@ All notable changes to `@sighthesia/pi-auto-reload` are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.3.3]
+
+### Fixed
+
+- **A reload could resend an already-handled message.** Every path that gives the
+  stashed text back to the editor now also writes its consumed marker. Previously
+  the recovery paths only warned and restored the editor text, so the stash stayed
+  "owed" forever — the session outlives the runtime, so the next reload replayed a
+  message the user had already been handed back. This is why an aborted turn turned
+  into a duplicate send on later reloads.
+- A stash older than 60 s is treated as abandoned: the replay path ignores it and
+  retires it, instead of resurrecting a message from a reload chain that ended long
+  ago.
+
 ## [1.3.2]
 
 ### Fixed

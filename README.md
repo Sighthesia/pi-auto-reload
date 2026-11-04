@@ -163,7 +163,11 @@ therefore do not trigger anything. A resource directory literally named `dist` o
 ## Failure behavior
 
 - **Reload never lands** (message dropped, turn collapsed): the stashed text goes
-  back into the editor with a warning. Your message is not lost silently.
+  back into the editor with a warning, and the stash is retired at the same time so
+  it can never be replayed later. Giving the text back without retiring it is what
+  used to make a later reload resend an already-handled message.
+- **A stash older than 60 s** is treated as abandoned: it is retired instead of
+  replayed, so a reload chain that ended long ago cannot resurrect a message.
 - **Another extension writes a session entry first**: the stash is located by id and
   its consumed marker, never by "is it the last entry". Extensions that append their
   own entries from `session_start` (subagent wakes, todo state) used to make the
