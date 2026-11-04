@@ -60,12 +60,16 @@ const TOGGLE_COMMAND = "auto-reload";
 const APPLY_ARG = "apply";
 /** Custom session entry carrying the intercepted message across the reload. */
 const PENDING_ENTRY = "pi.auto-reload-pending";
-/** Written right after a replay so a stale pending entry is never replayed twice. */
+/** Written once a pending entry is either replayed or handed back, so it never repeats. */
 const CONSUMED_ENTRY = "pi.auto-reload-consumed";
 /** A replay right after a reload must wait for the old run to settle; poll at this step. */
 const REPLAY_POLL_MS = 100;
-/** Give up waiting after this long and hand the text back to the editor. */
+/** Give up waiting for the session to go idle after this long. */
 const REPLAY_WAIT_MS = 10_000;
+/** How long a dispatched replay gets to actually start a run. */
+const REPLAY_CONFIRM_MS = 2_000;
+/** Attempts before the text goes back to the editor. */
+const REPLAY_ATTEMPTS = 3;
 /** Delay before re-creating watchers whose root was replaced. */
 const REARM_DELAY_MS = 1000;
 
@@ -290,6 +294,8 @@ function ignored(relative: string): boolean {
 }
 
 type StashedInput = {
+	/** Stable id referenced by the matching consumed entry. */
+	id: string;
 	text: string;
 	images?: { type: "image"; data: string; mimeType: string }[];
 	kinds: string[];
@@ -386,16 +392,35 @@ export default function (pi: ExtensionAPI) {
 		dirty.add(kind);
 	}
 
+	/**
+	 * Find the message stashed before the reload, if it is still owed.
+	 *
+	 * Why not "the newest entry": other extensions append their own custom entries
+	 * from their `session_start` handlers (pi-subagents wakes, todo state). Those
+	 * run in the same emit as ours, so whether the pending entry is still last is a
+	 * race — an earlier version keyed on that and silently dropped the user's
+	 * message whenever another extension wrote first. Instead, walk back to the
+	 * newest pending entry and consider it owed unless a consumed entry for its id
+	 * exists anywhere in the session.
+	 */
 	function readPending(sessionCtx: ExtensionContext): StashedInput | undefined {
 		try {
 			const entries = sessionCtx.sessionManager.getEntries();
-			const last = entries[entries.length - 1];
-			// Only the newest entry counts: anything appended after it means this
-			// entry was already consumed, or a later action supersedes it.
-			if (!last || last.type !== "custom" || last.customType !== PENDING_ENTRY) return undefined;
-			const data = last.data as StashedInput | undefined;
-			if (!data || typeof data.text !== "string") return undefined;
-			return data;
+			const consumed = new Set<string>();
+			for (const entry of entries) {
+				if (entry.type !== "custom" || entry.customType !== CONSUMED_ENTRY) continue;
+				const id = (entry.data as { id?: unknown } | undefined)?.id;
+				if (typeof id === "string") consumed.add(id);
+			}
+			for (let index = entries.length - 1; index >= 0; index -= 1) {
+				const entry = entries[index];
+				if (!entry || entry.type !== "custom" || entry.customType !== PENDING_ENTRY) continue;
+				const data = entry.data as StashedInput | undefined;
+				if (!data || typeof data.text !== "string") continue;
+				if (typeof data.id === "string" && consumed.has(data.id)) return undefined;
+				return data;
+			}
+			return undefined;
 		} catch {
 			return undefined;
 		}
@@ -415,51 +440,105 @@ export default function (pi: ExtensionAPI) {
 	}
 
 	/**
-	 * Replay after a reload.
+	 * Replay after a reload, confirming the message actually started.
 	 *
-	 * `sendUserMessage` is dropped when the session is busy. Right after a reload
-	 * the old run may still be settling, so wait for `isIdle()` — bounded, because a
-	 * stuck run must not swallow the message forever.
+	 * Two separate hazards, both silent:
+	 *
+	 * 1. Right after a reload the runtime may still be busy, and `sendUserMessage`
+	 *    issued while busy is dropped without an error (`prompt` throws, but the
+	 *    extension API does not return that promise, so it surfaces as a swallowed
+	 *    rejection). So wait for `isIdle()` first.
+	 * 2. `isIdle()` can flip between the check and the send, and a send can be
+	 *    dropped for other reasons. A fire-and-forget send therefore cannot be
+	 *    trusted: after sending, confirm the run actually started, retry a bounded
+	 *    number of times, and only then declare failure.
+	 *
+	 * The consumed entry is written only once the message is confirmed, so a send
+	 * that never landed leaves the stash replayable instead of being lost.
 	 *
 	 * The generation guard is what makes this safe: a reload can be followed by
 	 * `/new`, `/resume` or `/quit` inside the wait window, and touching the captured
 	 * `pi` or `sessionCtx` then throws (a replaced runtime's session-bound objects
-	 * are stale). `session_shutdown` bumps the generation, so the poller stops
-	 * before it can write into the next session.
+	 * are stale). `session_shutdown` bumps the generation.
 	 */
 	function replayWhenIdle(sessionCtx: ExtensionContext, pending: StashedInput): void {
 		const myGeneration = generation;
 		let waited = 0;
-		const tick = () => {
-			if (myGeneration !== generation) return;
-			if (!sessionCtx.hasUI) return;
-			const timedOut = waited >= REPLAY_WAIT_MS;
-			if (!sessionCtx.isIdle() && !timedOut) {
-				waited += REPLAY_POLL_MS;
-				const timer = setTimeout(tick, REPLAY_POLL_MS);
-				timer.unref?.();
-				return;
-			}
+		let attempts = 0;
+		let sentAt: number | undefined;
+
+		const alive = () => myGeneration === generation && sessionCtx.hasUI;
+
+		const handBack = (reason: string) => {
 			try {
-				pi.appendEntry(CONSUMED_ENTRY, { at: Date.now(), kinds: pending.kinds });
-				if (timedOut) {
-					// Still busy: sending now would be dropped silently. Keep the text where
-					// the user can reach it instead of pretending it went out.
-					sessionCtx.ui.notify?.(
-						`auto-reload: runtime stayed busy — your message was not sent: ${pending.text.slice(0, 60)}`,
-						"warning",
-					);
-					sessionCtx.ui.setEditorText?.(pending.text);
-					return;
-				}
-				replay(pending);
+				pi.appendEntry(CONSUMED_ENTRY, { id: pending.id, at: Date.now(), kinds: pending.kinds });
+				sessionCtx.ui.notify?.(`auto-reload: ${reason} — your message was not sent: ${pending.text.slice(0, 60)}`, "warning");
+				// Put it where the user can resend it instead of pretending it went out.
+				sessionCtx.ui.setEditorText?.(pending.text);
 			} catch {
-				// The runtime was replaced mid-tick; nothing left to do.
+				// Runtime went away; nothing to recover into.
 			}
 		};
-		// The reload's own settle handler runs after this one, so start on the next tick.
-		const timer = setTimeout(tick, REPLAY_POLL_MS);
-		timer.unref?.();
+
+		const done = () => {
+			try {
+				pi.appendEntry(CONSUMED_ENTRY, { id: pending.id, at: Date.now(), kinds: pending.kinds });
+			} catch {
+				// Runtime went away after a successful send; the entry is not replayable
+				// anyway because the reload chain ended.
+			}
+		};
+
+		const tick = () => {
+			if (!alive()) return;
+
+			// Confirming a send: a started run takes the session out of idle.
+			if (sentAt !== undefined) {
+				if (!sessionCtx.isIdle()) {
+					done();
+					return;
+				}
+				if (Date.now() - sentAt < REPLAY_CONFIRM_MS) {
+					schedule(REPLAY_POLL_MS);
+					return;
+				}
+				// The send did not take. Retry while we still have budget.
+				sentAt = undefined;
+				if (attempts >= REPLAY_ATTEMPTS || waited >= REPLAY_WAIT_MS) {
+					handBack("could not restart the agent");
+					return;
+				}
+			}
+
+			if (!sessionCtx.isIdle()) {
+				if (waited >= REPLAY_WAIT_MS) {
+					handBack("runtime stayed busy");
+					return;
+				}
+				waited += REPLAY_POLL_MS;
+				schedule(REPLAY_POLL_MS);
+				return;
+			}
+
+			try {
+				attempts += 1;
+				sentAt = Date.now();
+				replay(pending);
+			} catch {
+				sentAt = undefined;
+				handBack("replay failed");
+				return;
+			}
+			schedule(REPLAY_POLL_MS);
+		};
+
+		const schedule = (delay: number) => {
+			const timer = setTimeout(tick, delay);
+			timer.unref?.();
+		};
+
+		// The reload's own settle handlers run after this one, so start on the next tick.
+		schedule(REPLAY_POLL_MS);
 	}
 
 	pi.on("session_start", async (event, sessionCtx) => {
@@ -583,6 +662,7 @@ export default function (pi: ExtensionAPI) {
 		}
 
 		const pending: StashedInput = {
+			id: `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`,
 			text: event.text,
 			...(event.images?.length ? { images: event.images } : {}),
 			kinds: [...dirty],

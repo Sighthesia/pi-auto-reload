@@ -164,10 +164,16 @@ therefore do not trigger anything. A resource directory literally named `dist` o
 
 - **Reload never lands** (message dropped, turn collapsed): the stashed text goes
   back into the editor with a warning. Your message is not lost silently.
-- **Runtime still busy after the reload**: the replay polls `isIdle()` for up to
+- **Another extension writes a session entry first**: the stash is located by id and
+  its consumed marker, never by "is it the last entry". Extensions that append their
+  own entries from `session_start` (subagent wakes, todo state) used to make the
+  replay silently skip and the message vanish.
+- **Runtime still busy after the reload**: the replay waits for `isIdle()` for up to
   10 s, because a `sendUserMessage` issued while busy is dropped without an error.
-  Past the deadline it hands the text back to the editor instead of pretending it
-  was sent.
+- **The send does not start a run**: each dispatch is confirmed by watching for the
+  session to leave idle, retried up to 3 times, and only then handed back to the
+  editor with a warning. The consumed marker is written only after a confirmed send,
+  so an unconfirmed one stays replayable rather than being lost.
 - **Watcher root replaced** (`rm -rf extensions && mkdir extensions`): the watcher
   re-arms itself after 1 s rather than going permanently blind.
 - **`/new`, `/resume`, `/quit` during a pending replay**: a generation counter

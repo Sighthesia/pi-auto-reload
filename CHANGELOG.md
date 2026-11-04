@@ -5,6 +5,21 @@ All notable changes to `@sighthesia/pi-auto-reload` are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.3.2]
+
+### Fixed
+
+- **The replayed message could be silently dropped after a reload.** The stash was
+  only honoured while it was the newest session entry, but other extensions append
+  their own entries from `session_start` (subagent wakes, todo state), so whether it
+  stayed last was a race. It is now found by id and its consumed marker, regardless
+  of what else was written.
+- **A send that never started a run went unnoticed.** `sendUserMessage` gives no
+  result, so a dropped replay looked identical to a successful one. Each dispatch is
+  now confirmed by watching for the session to leave idle, retried up to 3 times,
+  and handed back to the editor with a warning if it never lands. The consumed marker
+  is written only after a confirmed send.
+
 ## [1.3.1]
 
 ### Fixed
