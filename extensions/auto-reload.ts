@@ -60,6 +60,8 @@ const TOGGLE_COMMAND = "auto-reload";
 const APPLY_ARG = "apply";
 /** Custom session entry carrying the intercepted message across the reload. */
 const PENDING_ENTRY = "pi.auto-reload-pending";
+/** Draft text preserved across a settle-triggered reload. */
+const SETTLE_DRAFT_ENTRY = "pi.auto-reload-draft";
 /** Written once a pending entry is either replayed or handed back, so it never repeats. */
 const CONSUMED_ENTRY = "pi.auto-reload-consumed";
 /** A replay right after a reload must wait for the old run to settle; poll at this step. */
@@ -227,6 +229,12 @@ type Config = {
 	ignore?: ResourceKind[];
 	/** Skip the confirmation notice on every reload. */
 	quiet?: boolean;
+	/**
+	 * Reload as soon as the agent settles, instead of waiting for the next message.
+	 * Removes the wait from the user's next prompt, at the cost of reloading while
+	 * they may still be typing.
+	 */
+	reloadOnSettle?: boolean;
 };
 
 const CONFIG_FILE = path.join(AGENT_DIR, "auto-reload.json");
@@ -280,6 +288,7 @@ function loadConfig(warn: (message: string) => void): Config {
 			);
 		}
 		if (typeof source.quiet === "boolean") config.quiet = source.quiet;
+		if (typeof source.reloadOnSettle === "boolean") config.reloadOnSettle = source.reloadOnSettle;
 		return config;
 	} catch (error) {
 		warn(`${CONFIG_FILE} could not be read (${(error as Error).message}) — using defaults`);
@@ -570,6 +579,66 @@ export default function (pi: ExtensionAPI) {
 		schedule(REPLAY_POLL_MS);
 	}
 
+	/**
+	 * Reload right after a run settles, so the user's next message never waits.
+	 *
+	 * `agent_settled` is the only final-idle signal: `agent_end` may still be
+	 * followed by a retry, a compaction, or queued follow-ups (`docs/extensions.md`
+	 * "agent_start / agent_end / agent_settled"). Work requested here is deferred
+	 * until every settled handler finishes, so dispatching the reload command is
+	 * safe. No message is stashed — nothing was intercepted.
+	 *
+	 * The catch: a reload briefly swaps the editor for a "Reloading…" box, so text
+	 * the user already typed would be destroyed. Preserve it and put it back in the
+	 * new runtime. If they are mid-composition, keep the change pending and let the
+	 * `input` hook reload on the next send instead.
+	 */
+	pi.on("agent_settled", (_event, settledCtx) => {
+		if (!config.reloadOnSettle || !enabled) return;
+		if (dirty.size === 0 || reloading) return;
+		if (!settledCtx.hasUI || !settledCtx.isIdle()) return;
+		// The slash trigger owns this case: it reloads before the menu opens.
+		if (settledCtx.ui.getEditorText?.()?.startsWith("/")) return;
+
+		const draft = settledCtx.ui.getEditorText?.() ?? "";
+		// Remember the draft and the kinds across the runtime swap.
+		if (draft.trim()) {
+			try {
+				pi.appendEntry(SETTLE_DRAFT_ENTRY, { draft, kinds: [...dirty], at: Date.now() });
+			} catch {
+				// Cannot persist it, so do not risk the draft.
+				return;
+			}
+		}
+		if (!config.quiet) {
+			settledCtx.ui.notify?.(`auto-reload: reloading (${[...dirty].join(", ")}) after the turn`, "info");
+		}
+		dispatchReload();
+	});
+
+	/**
+	 * Put back editor text that a settle-triggered reload had to preserve.
+	 *
+	 * Only the newest draft entry counts, and only while the editor is empty: if the
+	 * user already started typing in the reloaded runtime, their text wins.
+	 */
+	function restoreDraft(sessionCtx: ExtensionContext): void {
+		try {
+			const entries = sessionCtx.sessionManager.getEntries();
+			const last = entries[entries.length - 1];
+			if (!last || last.type !== "custom" || last.customType !== SETTLE_DRAFT_ENTRY) return;
+			const data = last.data as { draft?: unknown; at?: unknown } | undefined;
+			if (!data || typeof data.draft !== "string" || !data.draft.trim()) return;
+			// A draft is only useful for a moment; an old one belongs to a reload that
+			// already finished (or was abandoned).
+			if (typeof data.at === "number" && Date.now() - data.at > REPLAY_MAX_AGE_MS) return;
+			if (sessionCtx.ui.getEditorText?.()?.trim()) return;
+			sessionCtx.ui.setEditorText?.(data.draft);
+		} catch {
+			// Nothing to restore.
+		}
+	}
+
 	pi.on("session_start", async (event, sessionCtx) => {
 		ctx = sessionCtx;
 		generation += 1;
@@ -599,6 +668,7 @@ export default function (pi: ExtensionAPI) {
 			// it cannot resurface on a later reload.
 			const abandoned = readPending(sessionCtx);
 			if (abandoned) retire(abandoned);
+			restoreDraft(sessionCtx);
 			return;
 		}
 		ctx.ui.notify?.(`auto-reload: reloaded (${pending.kinds.join(", ")}) — resending your message`, "info");

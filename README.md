@@ -103,6 +103,7 @@ default, or under `PI_CODING_AGENT_DIR` when that is set.
 | `watch` | `string[]` | `[]` | Extra directories to watch, absolute or relative to the agent dir. A change in any of them counts as an `extensions` change. |
 | `ignore` | `string[]` | `[]` | Resource kinds to stop watching. Valid values: `extensions`, `skills`, `templates`, `keybindings`. |
 | `quiet` | `boolean` | `false` | Suppress the notice shown when a reload starts. Warnings about lost messages are never suppressed. |
+| `reloadOnSettle` | `boolean` | `false` | Reload as soon as the agent finishes a turn instead of waiting for your next message. Removes the reload wait from your next prompt; see below. |
 
 Notes:
 
@@ -115,6 +116,32 @@ Notes:
   typed keys are dropped silently.
 - `themes` is deliberately not an `ignore` value. Pi already hot-reloads the active
   user theme, so this extension never watches it in the first place.
+
+## Reloading when the turn ends
+
+By default a reload happens when you send your next message, so that message waits a
+moment. Set `reloadOnSettle` to move the reload earlier:
+
+```json
+{ "reloadOnSettle": true }
+```
+
+A change that lands while the agent works is then applied right after the turn ends,
+and your next message starts immediately. Measured on a local session: a send that
+triggers the reload reaches the model after ~10 s of setup, while a message sent after
+a settle reload starts in ~0 s.
+
+What it does not do:
+
+- It never reloads mid-run. `agent_settled` is Pi's final-idle signal, so retries,
+  compaction and queued follow-ups still finish first.
+- It does not fire while you are composing `/…`: the slash trigger handles that case.
+- Text already in the editor is preserved across the reload. If something goes wrong
+  restoring it, you get your text back rather than losing it.
+
+The trade-off is real but small: a reload swaps the editor for a "Reloading…" box for
+an instant. Leave the option off if you would rather never see that happen while
+typing.
 
 ## What is watched
 

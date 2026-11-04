@@ -5,6 +5,17 @@ All notable changes to `@sighthesia/pi-auto-reload` are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.4.0]
+
+### Added
+
+- **`reloadOnSettle` config option.** When enabled, a change that lands during a
+  turn is applied right after the turn ends (`agent_settled`, Pi's final-idle
+  signal) instead of waiting for the next message, so the next prompt starts
+  immediately. Text already in the editor is preserved across the reload and
+  restored in the new runtime; the slash trigger keeps owning the case where you
+  are already composing a `/` command. Off by default.
+
 ## [1.3.3]
 
 ### Fixed
