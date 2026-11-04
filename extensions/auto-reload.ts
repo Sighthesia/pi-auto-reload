@@ -73,7 +73,12 @@ const AGENT_DIR = process.env.PI_CODING_AGENT_DIR ?? path.join(os.homedir(), ".p
 
 type ResourceKind = "extensions" | "skills" | "templates" | "keybindings";
 
-const WATCHED_DIRS: { dir: string; kind: ResourceKind }[] = [
+/**
+ * Always watched, whether or not Pi reports anything from them: these are the
+ * default discovery locations, and a *new* file appearing there has no command
+ * yet to reveal it.
+ */
+const DEFAULT_DIRS: { dir: string; kind: ResourceKind }[] = [
 	{ dir: path.join(AGENT_DIR, "extensions"), kind: "extensions" },
 	{ dir: path.join(AGENT_DIR, "skills"), kind: "skills" },
 	{ dir: path.join(AGENT_DIR, "prompts"), kind: "templates" },
@@ -87,6 +92,116 @@ const WATCHED_FILES: { file: string; kind: ResourceKind }[] = [
 ];
 
 const IGNORED_EXT = /\.(log|tmp|swp|swx|swo|bak|old|orig|rej|~)$/i;
+
+/** A directory to watch and the resource kind a change there implies. */
+type WatchTarget = { dir: string; kind: ResourceKind };
+
+function expandHome(entry: string): string {
+	if (entry === "~") return os.homedir();
+	if (entry.startsWith("~/")) return path.join(os.homedir(), entry.slice(2));
+	return entry;
+}
+
+/**
+ * Resolve one `settings.json` resource entry to a directory.
+ *
+ * Entries may be globs (`prompts/*.md`), may carry `+`/`-`/`!` inclusion markers,
+ * and may be files. Anything that cannot be pinned to a directory returns
+ * undefined rather than guessing.
+ */
+function resolveResourceDir(entry: string): string | undefined {
+	const trimmed = entry.trim();
+	// `-x` disables a resource and `!x` excludes a glob match; neither is a root.
+	if (!trimmed || trimmed.startsWith("-") || trimmed.startsWith("!")) return undefined;
+	const withoutMarker = trimmed.startsWith("+") ? trimmed.slice(1) : trimmed;
+	if (/^(builtin|npm|git|https?):/.test(withoutMarker)) return undefined;
+	// Cut at the first glob metacharacter, then treat the remainder as the root.
+	const globIndex = withoutMarker.search(/[*?[{]/);
+	const literal = globIndex === -1 ? withoutMarker : withoutMarker.slice(0, globIndex);
+	if (!literal) return undefined;
+	const absolute = path.isAbsolute(literal) ? literal : path.resolve(AGENT_DIR, expandHome(literal));
+	const trimmedSlash = absolute.replace(/[/\\]+$/, "") || absolute;
+	try {
+		if (fs.statSync(trimmedSlash).isDirectory()) return trimmedSlash;
+	} catch {
+		// Missing path: still watch it if it names a directory, so creating it later counts.
+		return globIndex !== -1 ? trimmedSlash : undefined;
+	}
+	// It exists and is a file (for example `skills/foo/SKILL.md`).
+	return path.dirname(trimmedSlash);
+}
+
+/**
+ * Work out what to watch from what Pi actually loaded.
+ *
+ * Hard-coded `<agent-dir>/{extensions,skills,prompts}` is not enough: resources
+ * also come from `settings.json` arrays (`skills`, `prompts`, `extensions`),
+ * from packages, and from project-local directories. All of those end up in
+ * `pi.getCommands()`, whose `sourceInfo.path` is the on-disk file — so the
+ * loaded set is the authoritative answer, and the settings arrays add the roots
+ * that contain files Pi has not reported yet (a brand-new skill has no command).
+ */
+function deriveWatchTargets(pi: ExtensionAPI): WatchTarget[] {
+	const targets: WatchTarget[] = DEFAULT_DIRS.map((entry) => ({ ...entry }));
+
+	// Roots declared in settings, so a newly created resource under them counts even
+	// before Pi has ever loaded it.
+	try {
+		const settings = pi.getSettings() as Record<string, unknown>;
+		const kinds: [ResourceKind, unknown][] = [
+			["skills", settings.skills],
+			["templates", settings.prompts],
+			["extensions", settings.extensions],
+		];
+		for (const [kind, value] of kinds) {
+			if (!Array.isArray(value)) continue;
+			for (const entry of value) {
+				if (typeof entry !== "string") continue;
+				const dir = resolveResourceDir(entry);
+				if (dir) targets.push({ dir, kind });
+			}
+		}
+	} catch {
+		// Settings are best effort; the defaults and the loaded set still apply.
+	}
+
+	// Every loaded resource's own directory: covers packages, project-local files and
+	// anything else Pi found, without this extension having to model package layout.
+	try {
+		for (const command of pi.getCommands?.() ?? []) {
+			const file = command.sourceInfo?.path;
+			if (!file || !path.isAbsolute(file)) continue;
+			const kind: ResourceKind | undefined =
+				command.source === "skill" ? "skills" : command.source === "prompt" ? "templates" : command.source === "extension" ? "extensions" : undefined;
+			if (kind) targets.push({ dir: path.dirname(file), kind });
+		}
+	} catch {
+		// Same: the defaults remain.
+	}
+
+	return targets;
+}
+
+/**
+ * Drop targets that are already covered by a parent target, so one edit does not
+ * mark the same resource twice, and so a nested watch cannot outlive its parent.
+ */
+function pruneNested(targets: WatchTarget[]): WatchTarget[] {
+	const unique = new Map<string, WatchTarget>();
+	for (const target of targets) {
+		const key = path.resolve(target.dir);
+		if (!unique.has(key)) unique.set(key, { ...target, dir: key });
+	}
+	const sorted = [...unique.values()].sort((a, b) => a.dir.length - b.dir.length);
+	const kept: WatchTarget[] = [];
+	for (const target of sorted) {
+		// Never watch the filesystem root or the home directory wholesale.
+		if (target.dir === "/" || target.dir === os.homedir()) continue;
+		if (kept.some((parent) => target.dir.startsWith(`${parent.dir}${path.sep}`))) continue;
+		kept.push(target);
+	}
+	return kept;
+}
 
 /**
  * Optional config file: `<agent-dir>/auto-reload.json`.
@@ -210,17 +325,15 @@ export default function (pi: ExtensionAPI) {
 	function startWatchers(): void {
 		stopWatchers();
 		const skip = new Set(config.ignore ?? []);
-		const watchedDirs = WATCHED_DIRS.filter((entry) => !skip.has(entry.kind));
-		const watchedFiles = WATCHED_FILES.filter((entry) => !skip.has(entry.kind));
+		const watchedDirs = deriveWatchTargets(pi).filter((entry) => !skip.has(entry.kind));
 		// Extra roots from config: watched as `extensions`, the broadest kind, so a
 		// change there still forces a reload.
 		for (const entry of config.watch ?? []) {
 			const dir = path.isAbsolute(entry) ? entry : path.join(AGENT_DIR, entry);
-			if (!watchedDirs.some((existing) => existing.dir === dir)) {
-				watchedDirs.push({ dir, kind: "extensions" });
-			}
+			watchedDirs.push({ dir, kind: "extensions" });
 		}
-		for (const { dir, kind } of watchedDirs) {
+		const watchedFiles = WATCHED_FILES.filter((entry) => !skip.has(entry.kind));
+		for (const { dir, kind } of pruneNested(watchedDirs)) {
 			if (!fs.existsSync(dir)) continue;
 			try {
 				// Recursive inotify works on Linux (Node >= 20), macOS and Windows.

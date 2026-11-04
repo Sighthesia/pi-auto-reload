@@ -5,6 +5,19 @@ All notable changes to `@sighthesia/pi-auto-reload` are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.3.1]
+
+### Fixed
+
+- **Resources outside `<agent-dir>` were never watched.** The watch list was three
+  hard-coded directories plus `keybindings.json`, so a skill root declared in
+  `settings.json` (for example `~/.agents/skills`), a package's skills and prompts,
+  and an extension loaded through a local `packages` path were all invisible — edits
+  there never marked anything dirty, so neither sending a message nor typing `/` did
+  anything. The list is now derived from the settings arrays plus every loaded
+  resource reported by `pi.getCommands()`, with nested directories pruned and `/`
+  and the home directory excluded.
+
 ## [1.3.0]
 
 ### Added

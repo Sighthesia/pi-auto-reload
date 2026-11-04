@@ -118,16 +118,28 @@ Notes:
 
 ## What is watched
 
-| Path | Reload kind |
+The watch list is derived from what Pi actually loaded, not guessed:
+
+| Source | Reload kind |
 | --- | --- |
-| `<agent-dir>/extensions/` (recursive) | `extensions` |
-| `<agent-dir>/skills/` (recursive) | `skills` |
-| `<agent-dir>/prompts/` (recursive) | `templates` |
+| `<agent-dir>/extensions/`, `skills/`, `prompts/` (recursive) | `extensions` / `skills` / `templates` |
+| every directory named in settings `skills`, `prompts`, `extensions` (recursive) | matching kind |
+| the directory of every resource Pi reports in `pi.getCommands()` — package skills and prompts, project-local files, git packages | matching kind |
 | `<agent-dir>/keybindings.json` | `keybindings` |
 | `<cwd>/<config-dir>/keybindings.json` | `keybindings` |
 | every entry in `watch` | `extensions` |
 
 `<agent-dir>` is `~/.pi/agent` unless `PI_CODING_AGENT_DIR` overrides it.
+
+**Why the derived list matters.** Resources do not have to live under
+`<agent-dir>`. A `skills` entry in `settings.json` can point anywhere (this repo's
+author points it at `~/.agents/skills`), and packages — npm, git or local paths like
+`../../0_Files/...` — load from their own directories. Watching only the three
+default locations silently misses all of that. Settings arrays contribute their
+roots (so a brand-new skill counts before Pi has ever loaded it), and
+`pi.getCommands()` contributes one directory per loaded resource. Nested targets are
+pruned so one edit cannot mark the same kind twice, and the home directory or `/`
+is never watched wholesale.
 
 **Themes are excluded on purpose.** Pi already hot-reloads the active user theme
 from `<agent-dir>/themes/<name>.json`, so a watcher-triggered reload there would
