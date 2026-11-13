@@ -12,7 +12,7 @@ pi install npm:@sighthesia/pi-auto-reload
 ```
 
 Restart your Pi session. It starts enabled and silent; edit anything under
-`~/.pi/agent/skills/` and send a message to see it reload.
+`~/.pi/agent/skills/` and the next turn that ends will pick it up.
 
 Other install sources:
 
@@ -39,19 +39,20 @@ swallow what you were about to send.
 ```
 you edit a skill
       ↓  (only marks it dirty — no reload, no timer)
-you send your next message
+the turn ends
       ↓
-input hook intercepts, before /skill: and template expansion
+agent_settled fires, the runtime is reloaded
       ↓
-message is persisted, /auto-reload apply runs ctx.reload()
-      ↓
-new runtime re-sends your message, expanded against the fresh resources
+your next message starts immediately, against the fresh resources
 ```
 
-The `input` event fires after extension commands are checked and **before** skill
-and prompt-template expansion. That is the whole point: a stale skill can never be
-used, because the reload happens in the gap before expansion, and there is no timer
-to race.
+The `input` event is the fallback for the other case: with `reloadOnSettle` turned
+off, a reload waits for your next message. `input` fires after extension commands
+are checked and **before** skill and prompt-template expansion, so the reload
+happens in the gap before expansion — a stale skill can never be used, and there is
+no timer to race. That path persists the message, runs `/auto-reload apply`
+(which calls `ctx.reload()`), and the new runtime re-sends it against the fresh
+resources.
 
 Typing `/` covers the other half of the problem — seeing a newly created skill in
 the menu at all.
@@ -103,7 +104,7 @@ default, or under `PI_CODING_AGENT_DIR` when that is set.
 | `watch` | `string[]` | `[]` | Extra directories to watch, absolute or relative to the agent dir. A change in any of them counts as an `extensions` change. |
 | `ignore` | `string[]` | `[]` | Resource kinds to stop watching. Valid values: `extensions`, `skills`, `templates`, `keybindings`. |
 | `quiet` | `boolean` | `false` | Suppress the notice shown when a reload starts. Warnings about lost messages are never suppressed. |
-| `reloadOnSettle` | `boolean` | `false` | Reload as soon as the agent finishes a turn instead of waiting for your next message. Removes the reload wait from your next prompt; see below. |
+| `reloadOnSettle` | `boolean` | `true` | Reload as soon as the agent finishes a turn instead of waiting for your next message. Removes the reload wait from your next prompt; see below. |
 
 Notes:
 
@@ -119,17 +120,19 @@ Notes:
 
 ## Reloading when the turn ends
 
-By default a reload happens when you send your next message, so that message waits a
-moment. Set `reloadOnSettle` to move the reload earlier:
+On by default. A change that lands while the agent works is applied right after the
+turn ends, so your next message starts immediately instead of waiting for the
+reload. Measured on a local session: a send that triggers the reload reaches the
+model after ~10 s of setup, while a message sent after a settle reload starts in ~0 s.
+
+Turn it off with:
 
 ```json
-{ "reloadOnSettle": true }
+{ "reloadOnSettle": false }
 ```
 
-A change that lands while the agent works is then applied right after the turn ends,
-and your next message starts immediately. Measured on a local session: a send that
-triggers the reload reaches the model after ~10 s of setup, while a message sent after
-a settle reload starts in ~0 s.
+Then a reload happens when you send your next message, so that message waits a
+moment.
 
 What it does not do:
 
@@ -140,7 +143,7 @@ What it does not do:
   restoring it, you get your text back rather than losing it.
 
 The trade-off is real but small: a reload swaps the editor for a "Reloading…" box for
-an instant. Leave the option off if you would rather never see that happen while
+an instant. Set the option to false if you would rather never see that happen while
 typing.
 
 ## What is watched
@@ -185,7 +188,8 @@ therefore do not trigger anything. A resource directory literally named `dist` o
 - Outside TUI mode (`-p`, JSON) no watchers are created at all.
 - The reload command itself re-checks `isIdle()` before calling `ctx.reload()`.
 - A change that lands while the agent works only marks resources dirty. Nothing is
-  reloaded until you send something new.
+  reloaded until the turn ends, or, with `reloadOnSettle` off, until you send
+  something new.
 
 ## Failure behavior
 
@@ -218,7 +222,7 @@ reload a session, but they watch different things:
 | | `pi-auto-reload` | this package |
 | --- | --- | --- |
 | Triggers on | installed npm packages changing on disk, `settings.json`'s package list, channel server upgrades | your hand-edited resource files |
-| When | polls every 15 s, reloads as soon as idle | on your next message, before skill/template expansion |
+| When | polls every 15 s, reloads as soon as idle | when a turn ends, or on your next message before skill/template expansion |
 | Timer | yes | no |
 
 They can be installed together; the command names do not collide.
@@ -230,8 +234,8 @@ They can be installed together; the command names do not collide.
 
 ## Notes
 
-- Editing the extension itself triggers a reload on your next message. That is
-  expected.
+- Editing the extension itself triggers a reload on the next turn end, or on your
+  next message. That is expected.
 - The message is stored as a custom session entry while the reload is in flight,
   because a reload replaces the runtime and in-memory state does not survive it.
 

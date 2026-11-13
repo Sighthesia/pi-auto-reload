@@ -2,14 +2,25 @@
  * Auto-Reload Extension
  *
  * Reloads Pi's runtime lazily: a change never triggers a reload by itself. The
- * reload happens right before the next thing that would use the changed
- * resource — the user's next message, including `/skill:…` and prompt-template
- * invocations — and that message is then replayed on the new runtime.
+ * reload happens at the next moment that cannot break the agent — right after a
+ * turn ends, or, with `reloadOnSettle` turned off, right before the next thing
+ * that would use the changed resource — the user's next message, including
+ * `/skill:…` and prompt-template invocations — and that message is then replayed
+ * on the new runtime.
  *
  * Why the `input` hook: `input` fires after extension commands are checked and
  * before skill/prompt-template expansion (`docs/extensions.md` "Input Events"),
  * so intercepting there reloads before a stale skill, template, keybinding or
  * extension can be used, without any timer or race.
+ *
+ * Flow (agent idle, resources dirty, a turn ends):
+ *   1. `agent_settled` fires — Pi's final-idle signal, so retries, compaction and
+ *      queued follow-ups have finished. Work requested there is deferred until
+ *      every settled handler is done, so dispatching the reload command is safe.
+ *   2. The reload runs without intercepting anything: no message is stashed. Text
+ *      already in the editor is persisted as a session entry and restored in the
+ *      new runtime, so the user's next prompt starts immediately against fresh
+ *      resources.
  *
  * Flow (agent idle, resources dirty, user types `/`):
  *   1. An autocomplete provider notices the lone `/` at the start of the line and
@@ -19,7 +30,8 @@
  *      That request answers empty — the menu opens on the next keystroke against
  *      the reloaded runtime.
  *
- * Flow (agent idle, resources dirty, user sends a message):
+ * Flow (agent idle, resources dirty, user sends a message — the fallback used
+ * when `reloadOnSettle` is off):
  *   1. `input` returns `{ action: "handled" }`, so the agent never starts on the
  *      stale runtime (verified: the prompt response reports `handled`).
  *   2. The message is persisted as a custom session entry (JSON-safe) — reload
@@ -33,8 +45,10 @@
  *      skills/templates.
  *
  * The agent is never reloaded mid-run: a change that lands while it works only
- * marks resources dirty; interception needs an idle agent by definition, since
- * `input` for a new prompt only arrives when idle (`streamingBehavior` is unset).
+ * marks resources dirty. The settle handler waits for `agent_settled`, Pi's
+ * final-idle signal, and the interception path needs an idle agent by definition,
+ * since `input` for a new prompt only arrives when idle (`streamingBehavior` is
+ * unset).
  *
  * Watched resources (what `/reload` refreshes):
  *   extensions/   -> "extensions"      skills/  -> "skills"
@@ -232,9 +246,10 @@ type Config = {
 	/**
 	 * Reload as soon as the agent settles, instead of waiting for the next message.
 	 * Removes the wait from the user's next prompt, at the cost of reloading while
-	 * they may still be typing.
+	 * they may still be typing. On by default; set it to false to go back to
+	 * reloading on the next message only.
 	 */
-	reloadOnSettle?: boolean;
+	reloadOnSettle: boolean;
 };
 
 const CONFIG_FILE = path.join(AGENT_DIR, "auto-reload.json");
@@ -270,15 +285,16 @@ function saveEnabled(value: boolean): void {
 }
 
 function loadConfig(warn: (message: string) => void): Config {
+	// The defaults live here, so a missing or broken file still gets them.
+	const config: Config = { reloadOnSettle: true };
 	try {
-		if (!fs.existsSync(CONFIG_FILE)) return {};
+		if (!fs.existsSync(CONFIG_FILE)) return config;
 		const raw: unknown = JSON.parse(fs.readFileSync(CONFIG_FILE, "utf8"));
 		if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
 			warn(`${CONFIG_FILE} must contain a JSON object — using defaults`);
-			return {};
+			return config;
 		}
 		const source = raw as Record<string, unknown>;
-		const config: Config = {};
 		if (Array.isArray(source.watch)) {
 			config.watch = source.watch.filter((entry): entry is string => typeof entry === "string" && entry.length > 0);
 		}
@@ -292,7 +308,7 @@ function loadConfig(warn: (message: string) => void): Config {
 		return config;
 	} catch (error) {
 		warn(`${CONFIG_FILE} could not be read (${(error as Error).message}) — using defaults`);
-		return {};
+		return config;
 	}
 }
 
@@ -321,7 +337,7 @@ export default function (pi: ExtensionAPI) {
 	let enabled = loadEnabled();
 	let ctx: ExtensionContext | undefined;
 	let watchers: fs.FSWatcher[] = [];
-	let config: Config = {};
+	let config: Config = { reloadOnSettle: true };
 
 	/** Resource kinds changed since the last reload. */
 	const dirty = new Set<ResourceKind>();
