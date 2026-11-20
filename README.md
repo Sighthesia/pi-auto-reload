@@ -55,7 +55,7 @@ no timer to race. That path persists the message, runs `/auto-reload apply`
 resources.
 
 Typing `/` covers the other half of the problem — seeing a newly created skill in
-the menu at all.
+the menu at all, without retyping the `/` after the reload.
 
 You still get the reload — you just never wait for one, and never lose a message to
 one.
@@ -78,13 +78,16 @@ is also no footer line: the extension stays quiet until it actually reloads.
 
 Pi builds the slash menu from a snapshot, and only `/reload` rebuilds it. So a
 skill you just created is invisible in the menu until something reloads. Typing
-`/` at the start of an empty line now does that: if resources are dirty and the
-agent is idle, the reload is dispatched and the menu opens on the next keystroke
-with the fresh list.
+`/` at the start of an empty line does that: if resources are dirty and the agent
+is idle, the reload is dispatched, and the reloaded runtime reopens the menu by
+itself — the `/` stays put and the fresh list appears, so nothing has to be
+retyped.
 
-The cost is that the `/` itself shows no menu (the request that triggers the
-reload returns nothing); `/s` right after it lists the reloaded skills. If the
-agent is busy, nothing reloads and the menu behaves normally.
+Setting the editor text is not enough to bring the menu back: `setEditorText` goes
+through `setText()`, which cancels autocomplete. The reloaded runtime therefore
+re-triggers the editor's own `tryTriggerAutocomplete()`. If that surface is
+unavailable, nothing breaks — the menu simply opens on your next keystroke, as it
+used to. If the agent is busy, nothing reloads and the menu behaves normally.
 
 ## Configuration
 

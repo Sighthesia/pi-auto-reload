@@ -7,6 +7,16 @@ Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [1.5.0]
 
+### Added
+
+- **The slash menu reopens by itself after a reload.** Typing `/` while resources
+  are dirty still triggers the reload, but the `/` no longer needs retyping: the
+  reloaded runtime restores the editor text and re-triggers autocomplete, so the
+  fresh menu appears on its own. This needs the editor's own
+  `tryTriggerAutocomplete()` — `setEditorText` cannot do it, because setting text
+  cancels autocomplete. If that surface is missing, behaviour is unchanged: the
+  menu opens on your next keystroke.
+
 ### Changed
 
 - **`reloadOnSettle` is now on by default.** A change that lands while the agent

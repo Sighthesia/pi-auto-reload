@@ -27,8 +27,9 @@
  *      dispatches the reload. Pi builds the slash menu from a snapshot taken in
  *      `setupAutocompleteProvider()`, so only a reload can make a newly created
  *      skill appear there; `getSuggestions` is the only hook that sees typing.
- *      That request answers empty — the menu opens on the next keystroke against
- *      the reloaded runtime.
+ *      That request answers empty; the reloaded runtime then re-triggers
+ *      autocomplete on the `/` carried across the swap, so the menu opens by
+ *      itself and nothing has to be retyped.
  *
  * Flow (agent idle, resources dirty, user sends a message — the fallback used
  * when `reloadOnSettle` is off):
@@ -67,7 +68,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { CONFIG_DIR_NAME } from "@earendil-works/pi-coding-agent";
+import { CONFIG_DIR_NAME, CustomEditor } from "@earendil-works/pi-coding-agent";
 
 const TOGGLE_COMMAND = "auto-reload";
 /** Argument that turns the toggle command into the reload dispatcher. */
@@ -78,6 +79,12 @@ const PENDING_ENTRY = "pi.auto-reload-pending";
 const SETTLE_DRAFT_ENTRY = "pi.auto-reload-draft";
 /** Written once a pending entry is either replayed or handed back, so it never repeats. */
 const CONSUMED_ENTRY = "pi.auto-reload-consumed";
+/** Written before the slash-triggered reload: the new runtime reopens the menu from it. */
+const SLASH_ENTRY = "pi.auto-reload-slash";
+/** Written once a slash marker is consumed, so a later reload does not reopen the menu. */
+const SLASH_DONE_ENTRY = "pi.auto-reload-slash-done";
+/** Delay before re-triggering autocomplete, so the new editor is attached and focused. */
+const SLASH_MENU_DELAY_MS = 50;
 /** A replay right after a reload must wait for the old run to settle; poll at this step. */
 const REPLAY_POLL_MS = 100;
 /** Give up waiting for the session to go idle after this long. */
@@ -332,6 +339,22 @@ type StashedInput = {
 	kinds: string[];
 	at: number;
 };
+
+/** What the slash trigger needs to reopen the menu on the other side of a reload. */
+type SlashMarker = {
+	/** Stable id referenced by the matching done entry. */
+	id: string;
+	/** Editor text at the moment the reload was dispatched, normally `/`. */
+	text: string;
+	at: number;
+};
+
+/**
+ * The editor's undocumented re-trigger. It is the only way to reopen the menu:
+ * `setEditorText` goes through `setText()`, which cancels autocomplete first.
+ * Absent from the public types, so everything here is feature-detected.
+ */
+type AutocompleteTrigger = { tryTriggerAutocomplete?: (explicitTab?: boolean) => void };
 
 export default function (pi: ExtensionAPI) {
 	let enabled = loadEnabled();
@@ -655,6 +678,92 @@ export default function (pi: ExtensionAPI) {
 		}
 	}
 
+	/** Find the slash marker, if the trigger asked for the menu and it is still owed. */
+	function readSlashMarker(sessionCtx: ExtensionContext): SlashMarker | undefined {
+		try {
+			const entries = sessionCtx.sessionManager.getEntries();
+			const consumed = new Set<string>();
+			for (const entry of entries) {
+				if (entry.type !== "custom" || entry.customType !== SLASH_DONE_ENTRY) continue;
+				const id = (entry.data as { id?: unknown } | undefined)?.id;
+				if (typeof id === "string") consumed.add(id);
+			}
+			// The newest marker decides: an older one belongs to a reload that already
+			// consumed it (or was abandoned), and reopening from it would resurrect a menu.
+			for (let index = entries.length - 1; index >= 0; index -= 1) {
+				const entry = entries[index];
+				if (!entry || entry.type !== "custom" || entry.customType !== SLASH_ENTRY) continue;
+				const data = entry.data as SlashMarker | undefined;
+				if (!data || typeof data.id !== "string" || typeof data.text !== "string") continue;
+				if (consumed.has(data.id)) return undefined;
+				if (typeof data.at === "number" && Date.now() - data.at > REPLAY_MAX_AGE_MS) return undefined;
+				return data;
+			}
+			return undefined;
+		} catch {
+			return undefined;
+		}
+	}
+
+	/**
+	 * Reopen the slash menu in the reloaded runtime.
+	 *
+	 * Why a replacement editor: the menu is opened by the editor itself (a typed `/`
+	 * goes through `insertCharacter` -> `tryTriggerAutocomplete`), and nothing outside
+	 * the editor holds that instance. `setEditorComponent` is the only way to obtain
+	 * it, and Pi hands the current text to the replacement, so the `/` survives even
+	 * when the swap empties the old editor.
+	 *
+	 * Everything here is best effort. Pi copies text, padding and autocomplete width
+	 * onto a replacement editor but not `embedWorkingStatus`, hence passing it when
+	 * there is no previous factory to defer to (a monkey-patched
+	 * `setEditorComponent`, as pi-open-tui does, is the case where there is one).
+	 * Without the editor or the undocumented method the menu simply opens on the next
+	 * keystroke, which is what happened before this existed.
+	 */
+	function restoreSlashMenu(sessionCtx: ExtensionContext, marker: SlashMarker): void {
+		// Consume first: a menu that fails to open must not retry on every later reload.
+		try {
+			pi.appendEntry(SLASH_DONE_ENTRY, { id: marker.id, at: Date.now() });
+		} catch {
+			// Runtime is gone; nothing to protect against.
+		}
+
+		// Untyped on purpose: the editor component is not part of the public API, and the
+		// one method used below is cast to `AutocompleteTrigger` at the call site.
+		let captured: unknown;
+		try {
+			if (typeof sessionCtx.ui.setEditorComponent !== "function") return;
+			const previous = sessionCtx.ui.getEditorComponent?.();
+			sessionCtx.ui.setEditorComponent((tui, theme, keybindings) => {
+				const editor =
+					previous?.(tui, theme, keybindings) ?? new CustomEditor(tui, theme, keybindings, { embedWorkingStatus: true });
+				captured = editor;
+				return editor;
+			});
+		} catch {
+			// No editable surface (RPC, print): degrade to the next-keystroke behaviour.
+			return;
+		}
+
+		const myGeneration = generation;
+		const timer = setTimeout(() => {
+			// Same guard as the replay poller: `/new`, `/resume` or `/quit` inside the delay
+			// throws on the captured session objects. A busy session means a replayed
+			// message is already starting; a menu over that run would be noise.
+			if (myGeneration !== generation || !sessionCtx.hasUI || !sessionCtx.isIdle()) return;
+			try {
+				// The swap may have emptied the editor; put the text back before asking for
+				// suggestions, which are derived from it.
+				if (!sessionCtx.ui.getEditorText?.()?.trim()) sessionCtx.ui.setEditorText?.(marker.text);
+				(captured as AutocompleteTrigger | undefined)?.tryTriggerAutocomplete?.(false);
+			} catch {
+				// The editor is a private surface; a failure here only means no menu.
+			}
+		}, SLASH_MENU_DELAY_MS);
+		timer.unref?.();
+	}
+
 	pi.on("session_start", async (event, sessionCtx) => {
 		ctx = sessionCtx;
 		generation += 1;
@@ -679,29 +788,35 @@ export default function (pi: ExtensionAPI) {
 		// A reload replaced the runtime: this extension's `dirty` set is gone with
 		// it, and the intercepted message (if any) is waiting in the session.
 		const pending = readPending(sessionCtx, { maxAgeMs: REPLAY_MAX_AGE_MS });
-		if (!pending) {
-			// Anything older than the window is an abandoned reload; retire it silently so
-			// it cannot resurface on a later reload.
-			const abandoned = readPending(sessionCtx);
-			if (abandoned) retire(abandoned);
-			restoreDraft(sessionCtx);
-			return;
+		// Both exits below owe the menu: the slash trigger is the case with no message.
+		try {
+			if (!pending) {
+				// Anything older than the window is an abandoned reload; retire it silently so
+				// it cannot resurface on a later reload.
+				const abandoned = readPending(sessionCtx);
+				if (abandoned) retire(abandoned);
+				restoreDraft(sessionCtx);
+				return;
+			}
+			ctx.ui.notify?.(`auto-reload: reloaded (${pending.kinds.join(", ")}) — resending your message`, "info");
+			replayWhenIdle(sessionCtx, pending);
+		} finally {
+			const marker = readSlashMarker(sessionCtx);
+			if (marker) restoreSlashMenu(sessionCtx, marker);
 		}
-		ctx.ui.notify?.(`auto-reload: reloaded (${pending.kinds.join(", ")}) — resending your message`, "info");
-		replayWhenIdle(sessionCtx, pending);
 	});
 
 	/**
-	 * Makes typing `/` reload the runtime, so the slash menu that opens on the
-	 * next keystroke already lists newly created skills, templates and commands.
+	 * Makes typing `/` reload the runtime, so the slash menu lists newly created
+	 * skills, templates and commands without retyping anything.
 	 *
 	 * Why this is an autocomplete provider and not something cleaner: Pi builds the
 	 * slash menu from a snapshot taken in `setupAutocompleteProvider()`, and only
 	 * `/reload` rebuilds it (see `handleReloadCommand`). `getSuggestions` is the
 	 * one hook that observes typing, and it cannot rewrite that snapshot — it can
 	 * only return items. So the reload is dispatched from here and *this* request
-	 * answers empty; the provider installed by the reloaded runtime serves the
-	 * second keystroke with fresh resources.
+	 * answers empty; the reloaded runtime then reopens the menu itself, because the
+	 * swap cannot be observed and the `/` may not even survive it.
 	 *
 	 * Guards, because a reload discards session state: the user must actually have
 	 * just typed `/` at the start of the line, resources must be dirty, the agent
@@ -714,6 +829,20 @@ export default function (pi: ExtensionAPI) {
 				const beforeCursor = line.slice(0, cursorCol);
 				const atSlash = cursorLine === 0 && beforeCursor === "/";
 				if (atSlash && enabled && dirty.size > 0 && !reloading && sessionCtx.isIdle()) {
+					// Remember what to reopen on the other side. The swap destroys both the menu
+					// and possibly the text, and the new runtime has no way to know a menu was
+					// expected. A failed write must not stop the reload — the menu then opens on
+					// the next keystroke, as it did before this existed.
+					const marker: SlashMarker = {
+						id: `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`,
+						text: sessionCtx.ui.getEditorText?.() ?? "/",
+						at: Date.now(),
+					};
+					try {
+						pi.appendEntry(SLASH_ENTRY, marker);
+					} catch {
+						// Best effort: the reload itself matters more than the menu.
+					}
 					dispatchReload();
 					return { prefix: "/", items: [] };
 				}

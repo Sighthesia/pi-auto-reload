@@ -56,6 +56,15 @@ non-obvious. Re-verify rather than assume if Pi's version moves.
   the intercepted message travels as a custom session entry.
 - `appendEntry` writes land at the end of `getEntries()`, and `session_start` fires
   with `reason: "reload"` after the swap.
+- `ctx.ui.setEditorText()` reaches the editor's `setText()`, which calls
+  `cancelAutocomplete()` first — so it can never reopen the slash menu. The only way
+  to re-trigger it is the editor's **undocumented** `tryTriggerAutocomplete()`
+  (not in the public types), which is why every caller of it is feature-detected.
+  The instance is reachable only through `setEditorComponent`, and Pi copies text,
+  padding, border colour and completion width onto a replacement editor but **not**
+  `embedWorkingStatus`, which therefore has to be passed explicitly to keep the
+  default look. Verified against the 1.5.1 bundle (`setCustomEditorComponent`,
+  `Editor.tryTriggerAutocomplete`).
 
 ## Conventions
 
